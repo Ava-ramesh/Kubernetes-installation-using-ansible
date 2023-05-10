@@ -1,0 +1,163 @@
+- name: Kubernetes installation
+  hosts: node1,node2
+  become: true
+  tasks:
+    - name: Set hostname for master-node
+      hostname:
+        name: master-node
+      when: inventory_hostname == 'node1'
+
+    - name: set hostname for worker-node
+      hostname:
+        name: node-1
+      when: inventory_hostname == 'node2'
+
+    - name: Add entries to /etc/hosts
+      shell: |
+        cat <<EOF>> /etc/hosts
+        192.168.56.110 master-node
+        192.168.56.109 node-1 worker-node-1
+        EOF
+
+    - name: Disable SELinux
+      selinux:
+        policy: targeted
+        state: disabled
+
+    - name: Disable swap
+      shell: swapoff -a
+      ignore_errors: yes
+
+    - name: Create kubernetes.repo file
+      copy:
+       dest: /etc/yum.repos.d/kubernetes.repo
+       content: |
+         [kubernetes]
+         name=Kubernetes
+         baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+         enabled=1
+         gpgcheck=1
+         repo_gpgcheck=1
+         gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+
+    - name: Stop firewall service
+      service:
+        name: firewalld
+        state: stopped
+      
+     - name: Load br_netfilter kernel module
+      shell: modprobe br_netfilter
+
+    - name: Enable bridge-netfilter
+      sysctl:
+        name: net.bridge.bridge-nf-call-iptables
+        value: 1
+        state: present
+
+    - name: Add cri-o repository
+      copy:
+        dest: /etc/yum.repos.d/devel:kubic:libcontainers:stable:cri-o:1.26.repo
+        content: |
+          [devel_kubic_libcontainers_stable_cri-o_1.26]
+          name=devel:kubic:libcontainers:stable:cri-o:1.26
+          baseurl=https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/1.26/CentOS_7/
+          gpgcheck=1
+          gpgkey=https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/1.26/CentOS_7/repodata/repomd.xml.key
+          enabled=1
+
+
+    - name: Install cri-o
+      yum:
+         name:
+            - cri-o
+            - cri-tools
+            - containernetworking-plugins
+         state: present
+
+    - name: start cri-o
+      systemd:
+         name: crio.service
+         state: started
+
+
+    - name: Install kubeadm, kubelet and kubectl
+      yum:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: present
+
+    - name: enable kubelet
+      systemd:
+        name: kubelet
+        state: started
+
+    - name: initialize kubernetes master
+      shell: kubeadm init --control-plane-endpoint "192.168.56.110:6443"
+      when: inventory_hostname == 'node1'
+      register: token
+
+    - name: delete the existing shell script in the name of token.sh
+      shell: rm -rf token.sh
+
+    - name: Create shell script
+      ansible.builtin.shell: touch /home/master/token.sh
+      when: inventory_hostname == 'node1'
+
+    - name: Save token to shell script
+      lineinfile:
+        dest: /home/master/token.sh
+        line: "{{ token.stdout_lines[-2:] | join('') }}"
+        mode: 0770
+      when: inventory_hostname == 'node1'
+
+    - name: fetch the shell script from node 1 to ansible server.
+      fetch:
+        src: /home/master/token.sh
+        dest: /home/rameshtest
+        mode: 0770
+      when: inventory_hostname == 'node1'
+
+    - name: Create shell script
+      ansible.builtin.shell: touch /home/worker/token.sh
+      when: inventory_hostname == 'node2'
+
+    - name: Copy the file from ansible server and paste in the node 2.
+      copy:
+        src: /home/rameshtest/node1/home/master/token.sh
+        dest: /home/worker/token.sh
+        mode: 0770
+      when: inventory_hostname == 'node2'
+
+    - name: Create kube directory
+      shell: mkdir -p $HOME/.kube
+      when: inventory_hostname == 'node1'
+
+    - name: Copy admin.conf to kube directory
+      ansible.builtin.shell: sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+      when: inventory_hostname == 'node1'
+
+    - name: Set ownership of kubeconfig file
+      ansible.builtin.shell: sudo chown $(id -u):$(id -g) $HOME/.kube/config
+      when: inventory_hostname == 'node1'
+    - name: Read token arguments
+      shell: "grep -i 'kubeadm join.*' token.sh"
+      register: jointoken
+      when: inventory_hostname == 'node2'
+
+    - name: delete the existing shell script in the name of join.sh
+      shell: rm -rf join.sh
+      when: inventory_hostname == 'node2'
+
+    - name: Write variable to shell script
+      shell: echo """echo {{ jointoken.stdout }}"" | sed 's/ \\ / /g'" > /home/worker/join.sh
+      when: inventory_hostname == 'node2'
+
+    - name: set the permissions to 770 for join.sh
+      shell: chmod 770 join.sh
+      when: inventory_hostname == 'node2'
+
+    - name: join the worker node to master node
+      shell: grep -i 'kubeadm join' join.sh | bash | bash
+      when: inventory_hostname == 'node2'
